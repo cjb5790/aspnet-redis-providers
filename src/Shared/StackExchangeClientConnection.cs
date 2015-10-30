@@ -18,25 +18,38 @@ namespace Microsoft.Web.Redis
         ConnectionMultiplexer _redisMultiplexer;
         IDatabase _connection;
         ProviderConfiguration _configuration;
-        ConfigurationOptions configOption;
+        ConfigurationOptions _configOption;
+        private ConfigurationOptions _sentinelConfiguration;
+        private ConnectionMultiplexer _sentinelConnection;
 
-        public StackExchangeClientConnection(ProviderConfiguration configuration)
+      public StackExchangeClientConnection(ProviderConfiguration configuration)
         {
             _configuration = configuration;
+            _configOption = ParseConfiguration(_configuration);
+            if (!string.IsNullOrEmpty(_configOption.ServiceName))
+            {
+              _sentinelConfiguration = CreateSentinellConfiguration(_configOption);
+              ModifyEndpointsForSentinelConfiguration(_configOption);
+            }
             ConnectToRedis(_configuration);
         }
 
         private void ConnectToRedis(ProviderConfiguration configuration)
         {
+          _redisMultiplexer = LogUtility.logger == null
+            ? ConnectionMultiplexer.Connect(_configOption)
+            : ConnectionMultiplexer.Connect(_configOption, LogUtility.logger);
+
+          _connection = _redisMultiplexer.GetDatabase(configuration.DatabaseId);
+        }
+
+        private ConfigurationOptions ParseConfiguration(ProviderConfiguration configuration)
+        {
+          ConfigurationOptions configOption;
           // If connection string is given then use it otherwise use individual options
           if (!string.IsNullOrEmpty(configuration.ConnectionString))
           {
             configOption = ConfigurationOptions.Parse(configuration.ConnectionString);
-
-            if (!string.IsNullOrEmpty(configOption.ServiceName))
-            {
-              ModifyEndpointsForSentinelConfiguration(configOption);
-            }
           }
           else
           {
@@ -49,9 +62,9 @@ namespace Microsoft.Web.Redis
             {
               configOption.EndPoints.Add(configuration.Host + ":" + configuration.Port);
             }
-            configOption.Password = configuration.AccessKey;
-            configOption.Ssl = configuration.UseSsl;
-            configOption.AbortOnConnectFail = false;
+              configOption.Password = configuration.AccessKey;
+              configOption.Ssl = configuration.UseSsl;
+              configOption.AbortOnConnectFail = false;
 
             if (configuration.ConnectionTimeoutInMilliSec != 0)
             {
@@ -63,42 +76,47 @@ namespace Microsoft.Web.Redis
               configOption.SyncTimeout = configuration.OperationTimeoutInMilliSec;
             }
           }
-
-          _redisMultiplexer = LogUtility.logger == null
-            ? ConnectionMultiplexer.Connect(configOption)
-            : ConnectionMultiplexer.Connect(configOption, LogUtility.logger);
-
-          _connection = _redisMultiplexer.GetDatabase(configuration.DatabaseId);
+          return configOption;
         }
-        private void ModifyEndpointsForSentinelConfiguration(ConfigurationOptions configOption)
-        {
+
+          private void ModifyEndpointsForSentinelConfiguration(ConfigurationOptions configOption)
+          {
+              ConnectToSentinel();
+              EndPoint masterEndPoint = _sentinelConnection.GetServer(_sentinelConnection.GetEndPoints().First()).SentinelGetMasterAddressByName(_sentinelConfiguration.ServiceName);
+              configOption.EndPoints.Clear();
+              configOption.EndPoints.Add(masterEndPoint);
+          }
+
+          private ConfigurationOptions CreateSentinellConfiguration(ConfigurationOptions configOption)
+          {
             var sentinelConfiguration = new ConfigurationOptions
             {
-                CommandMap = CommandMap.Sentinel,
-                TieBreaker = "",
-                ServiceName = configOption.ServiceName,
-                SyncTimeout = configOption.SyncTimeout
+              CommandMap = CommandMap.Sentinel,
+              TieBreaker = "",
+              ServiceName = configOption.ServiceName,
+              SyncTimeout = configOption.SyncTimeout,
             };
-
-            EndPoint masterEndPoint = null;
-
-            foreach (var endpoint in configOption.EndPoints)
+            foreach (var endPoint in configOption.EndPoints)
             {
-                sentinelConfiguration.EndPoints.Add(endpoint);
-                var sentinelConnection = ConnectionMultiplexer.Connect(sentinelConfiguration);
-                var subscriber = sentinelConnection.GetSubscriber();
-                subscriber.Subscribe("+switch-master", MasterWasSwitched);
-                masterEndPoint = sentinelConnection.GetServer(endpoint).SentinelGetMasterAddressByName(sentinelConfiguration.ServiceName);
-
-                if (masterEndPoint != null)
-                {
-                    break;
-                }
+              sentinelConfiguration.EndPoints.Add(endPoint);
             }
+            return sentinelConfiguration;
+          }
 
-            configOption.EndPoints.Clear();
-            configOption.EndPoints.Add(masterEndPoint);
-        }
+          private void ConnectToSentinel()
+          {
+            _sentinelConnection = ConnectionMultiplexer.Connect(_sentinelConfiguration);
+            var subscriber = _sentinelConnection.GetSubscriber();
+            subscriber.Subscribe("+switch-master", MasterWasSwitched);
+            _sentinelConnection.ConnectionFailed += SentinelConnectionFailed;
+          }
+
+          private void SentinelConnectionFailed(object sender, ConnectionFailedEventArgs e)
+          {
+            _sentinelConnection.ConnectionFailed -= SentinelConnectionFailed;
+            _sentinelConnection.Close();
+            ConnectToSentinel();
+          }
 
         private void MasterWasSwitched(RedisChannel redisChannel, RedisValue redisValue)
         {
@@ -108,13 +126,13 @@ namespace Microsoft.Web.Redis
           var ip = IPAddress.Parse(messageParts[3]);
           var port = int.Parse(messageParts[4]);
           EndPoint newMasterEndpoint = new IPEndPoint(ip, port);
-          if (configOption.EndPoints.Any() && newMasterEndpoint == configOption.EndPoints[0]) return;
-          configOption.EndPoints.Clear();
-          configOption.EndPoints.Add(newMasterEndpoint);
+          if (_configOption.EndPoints.Any() && newMasterEndpoint == _configOption.EndPoints[0]) return;
+          _configOption.EndPoints.Clear();
+          _configOption.EndPoints.Add(newMasterEndpoint);
 
           _redisMultiplexer = LogUtility.logger == null
-            ? ConnectionMultiplexer.Connect(configOption)
-            : ConnectionMultiplexer.Connect(configOption, LogUtility.logger);
+            ? ConnectionMultiplexer.Connect(_configOption)
+            : ConnectionMultiplexer.Connect(_configOption, LogUtility.logger);
 
           _connection = _redisMultiplexer.GetDatabase(_configuration.DatabaseId);
         }
