@@ -11,6 +11,7 @@ namespace Microsoft.Web.Redis
     {
         internal static RedisSharedConnection sharedConnection;
         static object lockForSharedConnection = new object();
+        internal static RedisUtility redisUtility;
 
         internal IRedisClientConnection redisConnection;
         ProviderConfiguration configuration;
@@ -28,6 +29,7 @@ namespace Microsoft.Web.Redis
                     if (sharedConnection == null)
                     {
                         sharedConnection = new RedisSharedConnection(configuration,() => new StackExchangeClientConnection(configuration));
+                        redisUtility = new RedisUtility(configuration);
                     }
                 }
             }
@@ -41,8 +43,7 @@ namespace Microsoft.Web.Redis
         static readonly string addScript = (@"
                     local retVal = redis.call('GET',KEYS[1])
                     if retVal == false then
-                       redis.call('SET',KEYS[1], ARGV[1])
-                       redis.call('PEXPIRE',KEYS[1], ARGV[2])
+                       redis.call('PSETEX',KEYS[1],ARGV[2],ARGV[1])
                        retVal = ARGV[1]
                     end
                     return retVal
@@ -53,10 +54,10 @@ namespace Microsoft.Web.Redis
             key = GetKeyForRedis(key);
             TimeSpan expiryTime = utcExpiry - DateTime.UtcNow;
             string[] keyArgs = new string[] { key };
-            object[] valueArgs = new object[] { RedisUtility.GetBytesFromObject(entry), expiryTime.TotalMilliseconds };
+            object[] valueArgs = new object[] { redisUtility.GetBytesFromObject(entry), (long) expiryTime.TotalMilliseconds };
 
             object rowDataFromRedis = redisConnection.Eval(addScript, keyArgs, valueArgs);
-            return RedisUtility.GetObjectFromBytes(redisConnection.GetOutputCacheDataFromResult(rowDataFromRedis));
+            return redisUtility.GetObjectFromBytes(redisConnection.GetOutputCacheDataFromResult(rowDataFromRedis));
         }
 
 /*-------End of Add operation-----------------------------------------------------------------------------------------------------------------------------------------------*/
@@ -64,7 +65,7 @@ namespace Microsoft.Web.Redis
         public void Set(string key, object entry, DateTime utcExpiry)
         {
             key = GetKeyForRedis(key);
-            byte[] data = RedisUtility.GetBytesFromObject(entry);
+            byte[] data = redisUtility.GetBytesFromObject(entry);
             redisConnection.Set(key, data, utcExpiry);
         }
 
@@ -72,7 +73,7 @@ namespace Microsoft.Web.Redis
         {
             key = GetKeyForRedis(key);
             byte[] data = redisConnection.Get(key);
-            return RedisUtility.GetObjectFromBytes(data);
+            return redisUtility.GetObjectFromBytes(data);
         }
 
         public void Remove(string key)

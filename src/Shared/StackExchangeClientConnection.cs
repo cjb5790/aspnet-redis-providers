@@ -5,6 +5,7 @@
 
 using System;
 using System.Diagnostics;
+using System.Linq;
 using System.Net;
 using System.Web.SessionState;
 using StackExchange.Redis;
@@ -17,79 +18,132 @@ namespace Microsoft.Web.Redis
         ConnectionMultiplexer _redisMultiplexer;
         IDatabase _connection;
         ProviderConfiguration _configuration;
+        ConfigurationOptions _configOption;
+        private ConfigurationOptions _sentinelConfiguration;
+        private ConnectionMultiplexer _sentinelConnection;
+        private RedisUtility redisUtility;
 
-        public StackExchangeClientConnection(ProviderConfiguration configuration)
+      public StackExchangeClientConnection(ProviderConfiguration configuration)
         {
             _configuration = configuration;
-            ConfigurationOptions configOption;
-
-            // If connection string is given then use it otherwise use individual options
-            if (!string.IsNullOrEmpty(configuration.ConnectionString))
+            _configOption = ParseConfiguration(_configuration);
+            if (!string.IsNullOrEmpty(_configOption.ServiceName))
             {
-                configOption = ConfigurationOptions.Parse(configuration.ConnectionString);
+              _sentinelConfiguration = CreateSentinellConfiguration(_configOption);
+              ModifyEndpointsForSentinelConfiguration(_configOption);
+            }
+            ConnectToRedis(_configuration);
+            this.redisUtility = new RedisUtility(configuration);
+            this.configuration = configuration;
+            ConfigurationOptions configOption;
+        }
 
-                if (!string.IsNullOrEmpty(configOption.ServiceName))
-                {
-                    ModifyEndpointsForSentinelConfiguration(configOption);
-                }
+        private void ConnectToRedis(ProviderConfiguration configuration)
+        {
+          _redisMultiplexer = LogUtility.logger == null
+            ? ConnectionMultiplexer.Connect(_configOption)
+            : ConnectionMultiplexer.Connect(_configOption, LogUtility.logger);
+
+          _connection = _redisMultiplexer.GetDatabase(configuration.DatabaseId);
+        }
+
+        private ConfigurationOptions ParseConfiguration(ProviderConfiguration configuration)
+        {
+          ConfigurationOptions configOption;
+          // If connection string is given then use it otherwise use individual options
+          if (!string.IsNullOrEmpty(configuration.ConnectionString))
+          {
+            configOption = ConfigurationOptions.Parse(configuration.ConnectionString);
+          }
+          else
+          {
+            configOption = new ConfigurationOptions();
+            if (configuration.Port == 0)
+            {
+              configOption.EndPoints.Add(configuration.Host);
+              //configOption = ConfigurationOptions.Parse(configuration.ConnectionString);
+                // Setting explicitly 'abortconnect' to false. It will overwrite customer provided value for 'abortconnect'
+                // As it doesn't make sense to allow to customer to set it to true as we don't give them access to ConnectionMultiplexer
+                // in case of failure customer can not create ConnectionMultiplexer so right choice is to automatically create it by providing AbortOnConnectFail = false
+                //configOption.AbortOnConnectFail = false;
             }
             else
             {
-                configOption = new ConfigurationOptions();
-                if (configuration.Port == 0)
-                {
-                    configOption.EndPoints.Add(configuration.Host);
-                }
-                else
-                {
-                    configOption.EndPoints.Add(configuration.Host + ":" + configuration.Port);
-                }
-                configOption.Password = configuration.AccessKey;
-                configOption.Ssl = configuration.UseSsl;
-                configOption.AbortOnConnectFail = false;
+              configOption.EndPoints.Add(configuration.Host + ":" + configuration.Port);
+            }
+              configOption.Password = configuration.AccessKey;
+              configOption.Ssl = configuration.UseSsl;
+              configOption.AbortOnConnectFail = false;
 
-                if (configuration.ConnectionTimeoutInMilliSec != 0)
-                {
-                    configOption.ConnectTimeout = configuration.ConnectionTimeoutInMilliSec;
-                }
-
-                if (configuration.OperationTimeoutInMilliSec != 0)
-                {
-                    configOption.SyncTimeout = configuration.OperationTimeoutInMilliSec;
-                }
+            if (configuration.ConnectionTimeoutInMilliSec != 0)
+            {
+              configOption.ConnectTimeout = configuration.ConnectionTimeoutInMilliSec;
             }
 
-            _redisMultiplexer = LogUtility.logger == null ? ConnectionMultiplexer.Connect(configOption) : ConnectionMultiplexer.Connect(configOption, LogUtility.logger);
-
-            _connection = _redisMultiplexer.GetDatabase(configuration.DatabaseId);
+            if (configuration.OperationTimeoutInMilliSec != 0)
+            {
+              configOption.SyncTimeout = configuration.OperationTimeoutInMilliSec;
+            }
+          }
+          return configOption;
         }
 
-        private static void ModifyEndpointsForSentinelConfiguration(ConfigurationOptions configOption)
-        {
+          private void ModifyEndpointsForSentinelConfiguration(ConfigurationOptions configOption)
+          {
+              ConnectToSentinel();
+              EndPoint masterEndPoint = _sentinelConnection.GetServer(_sentinelConnection.GetEndPoints().First()).SentinelGetMasterAddressByName(_sentinelConfiguration.ServiceName);
+              configOption.EndPoints.Clear();
+              configOption.EndPoints.Add(masterEndPoint);
+          }
+
+          private ConfigurationOptions CreateSentinellConfiguration(ConfigurationOptions configOption)
+          {
             var sentinelConfiguration = new ConfigurationOptions
             {
-                CommandMap = CommandMap.Sentinel,
-                TieBreaker = "",
-                ServiceName = configOption.ServiceName,
-                SyncTimeout = configOption.SyncTimeout
+              CommandMap = CommandMap.Sentinel,
+              TieBreaker = "",
+              ServiceName = configOption.ServiceName,
+              SyncTimeout = configOption.SyncTimeout,
             };
-
-            EndPoint masterEndPoint = null;
-
-            foreach (var endpoint in configOption.EndPoints)
+            foreach (var endPoint in configOption.EndPoints)
             {
-                sentinelConfiguration.EndPoints.Add(endpoint);
-                var sentinelConnection = ConnectionMultiplexer.Connect(sentinelConfiguration);
-                masterEndPoint = sentinelConnection.GetServer(endpoint).SentinelGetMasterAddressByName(sentinelConfiguration.ServiceName);
-
-                if (masterEndPoint != null)
-                {
-                    break;
-                }
+              sentinelConfiguration.EndPoints.Add(endPoint);
             }
+            return sentinelConfiguration;
+          }
 
-            configOption.EndPoints.Clear();
-            configOption.EndPoints.Add(masterEndPoint);
+          private void ConnectToSentinel()
+          {
+            _sentinelConnection = ConnectionMultiplexer.Connect(_sentinelConfiguration);
+            var subscriber = _sentinelConnection.GetSubscriber();
+            subscriber.Subscribe("+switch-master", MasterWasSwitched);
+            _sentinelConnection.ConnectionFailed += SentinelConnectionFailed;
+          }
+
+          private void SentinelConnectionFailed(object sender, ConnectionFailedEventArgs e)
+          {
+            _sentinelConnection.ConnectionFailed -= SentinelConnectionFailed;
+            _sentinelConnection.Close();
+            ConnectToSentinel();
+          }
+
+        private void MasterWasSwitched(RedisChannel redisChannel, RedisValue redisValue)
+        {
+          if (redisValue.IsNullOrEmpty) return;
+          var message = redisValue.ToString();
+          var messageParts = message.Split(' ');
+          var ip = IPAddress.Parse(messageParts[3]);
+          var port = int.Parse(messageParts[4]);
+          EndPoint newMasterEndpoint = new IPEndPoint(ip, port);
+          if (_configOption.EndPoints.Any() && newMasterEndpoint == _configOption.EndPoints[0]) return;
+          _configOption.EndPoints.Clear();
+          _configOption.EndPoints.Add(newMasterEndpoint);
+
+          _redisMultiplexer = LogUtility.logger == null
+            ? ConnectionMultiplexer.Connect(_configOption)
+            : ConnectionMultiplexer.Connect(_configOption, LogUtility.logger);
+
+          _connection = _redisMultiplexer.GetDatabase(_configuration.DatabaseId);
         }
 
         public IDatabase RealConnection
@@ -164,34 +218,63 @@ namespace Microsoft.Web.Redis
         /// </summary>
         private object RetryLogic(Func<object> redisOperation)
         {
-            int timeToSleepBeforeRetryInMiliseconds = 20;
-            DateTime startTime = DateTime.Now;
-            while (true)
+          int timeToSleepBeforeRetryInMiliseconds = 20;
+          DateTime startTime = DateTime.Now;
+          while (true)
+          {
+            try
             {
-                try
-                {
-                    return RetryForScriptNotFound(redisOperation);
-                }
-                catch (Exception)
-                {
-                    TimeSpan passedTime = DateTime.Now - startTime;
-                    if (_configuration.RetryTimeout < passedTime)
-                    {
-                        throw;
-                    }
-
-                    var remainingTimeout = (int)(_configuration.RetryTimeout.TotalMilliseconds - passedTime.TotalMilliseconds);
-                    // if remaining time is less than 1 sec than wait only for that much time and than give a last try
-                    if (remainingTimeout < timeToSleepBeforeRetryInMiliseconds)
-                    {
-                        timeToSleepBeforeRetryInMiliseconds = remainingTimeout;
-                    }
-
-                    // First time try after 20 msec after that try after 1 second
-                    System.Threading.Thread.Sleep(timeToSleepBeforeRetryInMiliseconds);
-                    timeToSleepBeforeRetryInMiliseconds = 1000;
-                }
+              return RetryForScriptNotFound(redisOperation);
             }
+            catch (RedisConnectionException)
+            {
+              _redisMultiplexer.Close();
+              ConnectToRedis(_configuration);
+            }
+            catch (RedisServerException exception)
+            {
+              //if slaves are READONLY and master crash and goes up faster than we start connection to new master than connection is against READONLY slave
+              // and if we try to write command fail with this exception. Than we need to find new master and retry command against this new master.
+              if (exception.Message.Contains("READONLY"))
+              {
+                _redisMultiplexer.Close();
+                ConnectToRedis(_configuration);
+              }
+              else
+              {
+                TimeSpan passedTime = DateTime.Now - startTime;
+                if (_configuration.RetryTimeout < passedTime)
+                {
+                  throw;
+                }
+                timeToSleepBeforeRetryInMiliseconds = SleepBeforeRetry(passedTime, timeToSleepBeforeRetryInMiliseconds);
+              }
+            }
+            catch (Exception)
+            {
+              TimeSpan passedTime = DateTime.Now - startTime;
+              if (_configuration.RetryTimeout < passedTime)
+              {
+                throw;
+              }
+              timeToSleepBeforeRetryInMiliseconds = SleepBeforeRetry(passedTime, timeToSleepBeforeRetryInMiliseconds);
+            }
+          }
+        }
+
+        private int SleepBeforeRetry(TimeSpan passedTime, int timeToSleepBeforeRetryInMiliseconds)
+        {
+          var remainingTimeout = (int)(_configuration.RetryTimeout.TotalMilliseconds - passedTime.TotalMilliseconds);
+          // if remaining time is less than 1 sec than wait only for that much time and than give a last try
+          if (remainingTimeout < timeToSleepBeforeRetryInMiliseconds)
+          {
+            timeToSleepBeforeRetryInMiliseconds = remainingTimeout;
+          }
+
+          // First time try after 20 msec after that try after 1 second
+          System.Threading.Thread.Sleep(timeToSleepBeforeRetryInMiliseconds);
+          timeToSleepBeforeRetryInMiliseconds = 1000;
+          return timeToSleepBeforeRetryInMiliseconds;
         }
 
         public int GetSessionTimeout(object rowDataFromRedis)
@@ -243,7 +326,7 @@ namespace Microsoft.Web.Redis
             RedisResult[] lockScriptReturnValueArray = (RedisResult[])rowDataAsRedisResult;
             Debug.Assert(lockScriptReturnValueArray != null);
 
-            ISessionStateItemCollection sessionData = null;
+            ChangeTrackingSessionStateItemCollection sessionData = null;
             if (lockScriptReturnValueArray.Length > 1 && lockScriptReturnValueArray[1] != null)
             {
                 RedisResult[] data = (RedisResult[])lockScriptReturnValueArray[1];
@@ -252,16 +335,15 @@ namespace Microsoft.Web.Redis
                 // This list has to be even because it contains pair of <key, value> as {key, value, key, value}
                 if (data != null && data.Length != 0 && data.Length % 2 == 0)
                 {
-                    sessionData = new ChangeTrackingSessionStateItemCollection();
+                    sessionData = new ChangeTrackingSessionStateItemCollection(redisUtility);
                     // In every cycle of loop we are getting one pair of key value and putting it into session items
                     // thats why increment is by 2 because we want to move to next pair
                     for (int i = 0; (i + 1) < data.Length; i += 2)
                     {
                         string key = (string) data[i];
-                        object val = RedisUtility.GetObjectFromBytes((byte[]) data[i + 1]);
                         if (key != null)
                         {
-                            sessionData[key] = val;
+                            sessionData.SetData(key, (byte[])data[i + 1]);
                         }
                     }
                 }
