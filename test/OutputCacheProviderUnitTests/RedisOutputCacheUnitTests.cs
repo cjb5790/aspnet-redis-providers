@@ -50,7 +50,7 @@ namespace Microsoft.Web.Redis.UnitTests
             DateTime utcExpiry = DateTime.Now;
             RedisOutputCacheProvider cache = new RedisOutputCacheProvider();
             cache.cache = fake;
-            cache.Set("key1", "object", A<DateTime>.Ignored);
+            cache.Set("key1", "object", DateTime.Now);
             A.CallTo(() => fake.Set("key1", "object", A<DateTime>.Ignored)).MustHaveHappened();
         }
         [Fact]
@@ -75,12 +75,15 @@ namespace Microsoft.Web.Redis.UnitTests
             config.Add("port", "1234"); 
             config.Add("accessKey", "hello world");
             config.Add("ssl", "true");
+            config.Add("redisSerializerType", "Microsoft.Web.Redis.BinarySerializer");
             cache.Initialize("name", config);
 
             Assert.Equal(RedisOutputCacheProvider.configuration.Host, "localhost");
             Assert.Equal(RedisOutputCacheProvider.configuration.Port, 1234);
             Assert.Equal(RedisOutputCacheProvider.configuration.AccessKey, "hello world");
             Assert.Equal(RedisOutputCacheProvider.configuration.UseSsl, true);
+            Assert.Equal(RedisOutputCacheProvider.configuration.RedisSerializerType,
+                "Microsoft.Web.Redis.BinarySerializer");
         }
     }
 }

@@ -21,6 +21,7 @@ namespace Microsoft.Web.Redis
         ConfigurationOptions _configOption;
         private ConfigurationOptions _sentinelConfiguration;
         private ConnectionMultiplexer _sentinelConnection;
+        private RedisUtility redisUtility;
 
       public StackExchangeClientConnection(ProviderConfiguration configuration)
         {
@@ -32,6 +33,9 @@ namespace Microsoft.Web.Redis
               ModifyEndpointsForSentinelConfiguration(_configOption);
             }
             ConnectToRedis(_configuration);
+            this.redisUtility = new RedisUtility(configuration);
+            this.configuration = configuration;
+            ConfigurationOptions configOption;
         }
 
         private void ConnectToRedis(ProviderConfiguration configuration)
@@ -57,6 +61,11 @@ namespace Microsoft.Web.Redis
             if (configuration.Port == 0)
             {
               configOption.EndPoints.Add(configuration.Host);
+              //configOption = ConfigurationOptions.Parse(configuration.ConnectionString);
+                // Setting explicitly 'abortconnect' to false. It will overwrite customer provided value for 'abortconnect'
+                // As it doesn't make sense to allow to customer to set it to true as we don't give them access to ConnectionMultiplexer
+                // in case of failure customer can not create ConnectionMultiplexer so right choice is to automatically create it by providing AbortOnConnectFail = false
+                //configOption.AbortOnConnectFail = false;
             }
             else
             {
@@ -317,7 +326,7 @@ namespace Microsoft.Web.Redis
             RedisResult[] lockScriptReturnValueArray = (RedisResult[])rowDataAsRedisResult;
             Debug.Assert(lockScriptReturnValueArray != null);
 
-            ISessionStateItemCollection sessionData = null;
+            ChangeTrackingSessionStateItemCollection sessionData = null;
             if (lockScriptReturnValueArray.Length > 1 && lockScriptReturnValueArray[1] != null)
             {
                 RedisResult[] data = (RedisResult[])lockScriptReturnValueArray[1];
@@ -326,16 +335,15 @@ namespace Microsoft.Web.Redis
                 // This list has to be even because it contains pair of <key, value> as {key, value, key, value}
                 if (data != null && data.Length != 0 && data.Length % 2 == 0)
                 {
-                    sessionData = new ChangeTrackingSessionStateItemCollection();
+                    sessionData = new ChangeTrackingSessionStateItemCollection(redisUtility);
                     // In every cycle of loop we are getting one pair of key value and putting it into session items
                     // thats why increment is by 2 because we want to move to next pair
                     for (int i = 0; (i + 1) < data.Length; i += 2)
                     {
                         string key = (string) data[i];
-                        object val = RedisUtility.GetObjectFromBytes((byte[]) data[i + 1]);
                         if (key != null)
                         {
-                            sessionData[key] = val;
+                            sessionData.SetData(key, (byte[])data[i + 1]);
                         }
                     }
                 }
